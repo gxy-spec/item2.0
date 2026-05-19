@@ -9,3 +9,9 @@ DeepJSCC/models/
 DeepJSCC/results/
 DeepJSCC/kodak_dataset/
 DeepJSCC/kodak_dataset_src/
+
+step1/*.mat
+step1/*.png
+step1/outputs/
+step1/__pycache__/
+semantic_reconstruction_result.png
