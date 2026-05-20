@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+import math
 
 
 class MultimodalDualStreamAE(nn.Module):
@@ -47,7 +48,7 @@ class MultimodalDualStreamAE(nn.Module):
             nn.Linear(16, lidar_dim),
         )
 
-    def forward(self, x_hsi, x_lidar, snr_db=None):
+    def forward(self, x_hsi, x_lidar, snr_db=None, channel_type="awgn"):
         s_hsi = self.hsi_encoder(x_hsi)
         s_lidar = self.lidar_encoder(x_lidar)
         s_fused = torch.cat([s_hsi, s_lidar], dim=-1)
@@ -55,8 +56,19 @@ class MultimodalDualStreamAE(nn.Module):
         if snr_db is not None:
             signal_power = torch.mean(s_fused ** 2)
             noise_variance = signal_power / (10 ** (snr_db / 10.0))
-            noise = torch.randn_like(s_fused) * torch.sqrt(noise_variance + 1e-12)
-            s_fused = s_fused + noise
+
+            if channel_type == "awgn":
+                noise = torch.randn_like(s_fused) * torch.sqrt(noise_variance + 1e-12)
+                s_fused = s_fused + noise
+            elif channel_type == "rayleigh":
+                # 采用实值幅度衰落近似 Rayleigh 信道
+                h_real = torch.randn(s_fused.shape[0], 1, device=s_fused.device) / math.sqrt(2)
+                h_imag = torch.randn(s_fused.shape[0], 1, device=s_fused.device) / math.sqrt(2)
+                h = torch.sqrt(h_real ** 2 + h_imag ** 2)
+                noise = torch.randn_like(s_fused) * torch.sqrt(noise_variance + 1e-12)
+                s_fused = h * s_fused + noise
+            else:
+                raise ValueError(f"Unsupported channel type: {channel_type}")
 
         logits = self.classifier(s_fused)
         hsi_hat = self.hsi_decoder(s_fused)
@@ -156,7 +168,7 @@ def create_dataloaders(x_hsi, x_lidar, labels, batch_size):
     return train_loader, test_loader, hsi_stats, lidar_stats
 
 
-def evaluate_at_snr(model, test_loader, device, snr_db, num_repeats=5):
+def evaluate_at_snr(model, test_loader, device, snr_db, channel_type="awgn", num_repeats=5):
     aggregate = {"hsi_nmse": [], "lidar_nmse": [], "accuracy": []}
     model.eval()
 
@@ -174,7 +186,7 @@ def evaluate_at_snr(model, test_loader, device, snr_db, num_repeats=5):
                 batch_lidar = batch_lidar.to(device)
                 batch_labels = batch_labels.to(device)
 
-                hsi_hat, lidar_hat, logits = model(batch_hsi, batch_lidar, snr_db=snr_db)
+                hsi_hat, lidar_hat, logits = model(batch_hsi, batch_lidar, snr_db=snr_db, channel_type=channel_type)
                 hsi_nmse_num += torch.sum((hsi_hat - batch_hsi) ** 2).item()
                 hsi_nmse_den += torch.sum(batch_hsi ** 2).item()
                 lidar_nmse_num += torch.sum((lidar_hat - batch_lidar) ** 2).item()
@@ -198,13 +210,13 @@ def evaluate_at_snr(model, test_loader, device, snr_db, num_repeats=5):
     }
 
 
-def save_metric_curves(results_by_dim, snr_values, output_path):
+def save_metric_curves(results_by_dim, snr_values, output_path, channel_type="awgn"):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     for dim, metrics in results_by_dim.items():
-        axes[0].plot(snr_values, metrics["hsi_nmse"], marker="o", linewidth=2, label=f"Dim={dim}")
-        axes[1].plot(snr_values, metrics["lidar_nmse"], marker="s", linewidth=2, label=f"Dim={dim}")
-        axes[2].plot(snr_values, metrics["accuracy"], marker="^", linewidth=2, label=f"Dim={dim}")
+        axes[0].plot(snr_values, metrics["hsi_nmse"], marker="o", linewidth=2, label=f"Semantic Dim={dim}")
+        axes[1].plot(snr_values, metrics["lidar_nmse"], marker="s", linewidth=2, label=f"Semantic Dim={dim}")
+        axes[2].plot(snr_values, metrics["accuracy"], marker="^", linewidth=2, label=f"Semantic Dim={dim}")
 
         axes[0].fill_between(
             snr_values,
@@ -225,31 +237,37 @@ def save_metric_curves(results_by_dim, snr_values, output_path):
             alpha=0.15,
         )
 
-    axes[0].set_title("SNR vs HSI NMSE")
-    axes[0].set_xlabel("SNR (dB)")
-    axes[0].set_ylabel("NMSE")
+    axes[0].set_title("HSI Reconstruction Error vs. SNR")
+    axes[0].set_xlabel("Received SNR (dB)")
+    axes[0].set_ylabel("Normalised Mean Squared Error (NMSE)")
     axes[0].grid(True, linestyle="--", alpha=0.5)
     axes[0].legend()
 
-    axes[1].set_title("SNR vs LiDAR NMSE")
-    axes[1].set_xlabel("SNR (dB)")
-    axes[1].set_ylabel("NMSE")
+    axes[1].set_title("LiDAR Reconstruction Error vs. SNR")
+    axes[1].set_xlabel("Received SNR (dB)")
+    axes[1].set_ylabel("Normalised Mean Squared Error (NMSE)")
     axes[1].grid(True, linestyle="--", alpha=0.5)
     axes[1].legend()
 
-    axes[2].set_title("SNR vs Accuracy")
-    axes[2].set_xlabel("SNR (dB)")
-    axes[2].set_ylabel("Accuracy")
+    axes[2].set_title("Classification Accuracy vs. SNR")
+    axes[2].set_xlabel("Received SNR (dB)")
+    axes[2].set_ylabel("Classification Accuracy")
     axes[2].set_ylim(0.0, 1.0)
     axes[2].grid(True, linestyle="--", alpha=0.5)
     axes[2].legend()
 
-    plt.tight_layout()
+    plt.suptitle(
+        f"{channel_type.upper()} Channel Performance: Reconstruction and Classification Metrics",
+        fontsize=14,
+        fontweight="bold",
+        y=1.02,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(output_path, dpi=300)
     plt.close(fig)
 
 
-def reconstruct_full_maps(model, hsi_map, lidar_map, device, snr_db, hsi_stats, lidar_stats):
+def reconstruct_full_maps(model, hsi_map, lidar_map, device, snr_db, channel_type="awgn", hsi_stats=None, lidar_stats=None):
     height, width, hsi_dim = hsi_map.shape
     lidar_dim = lidar_map.shape[-1]
 
@@ -270,7 +288,12 @@ def reconstruct_full_maps(model, hsi_map, lidar_map, device, snr_db, hsi_stats, 
             if chunk_h.shape[0] <= 1:
                 h_hat, l_hat = chunk_h, chunk_l
             else:
-                h_hat, l_hat, _ = model(chunk_h, chunk_l, snr_db=snr_db)
+                h_hat, l_hat, _ = model(
+                    chunk_h,
+                    chunk_l,
+                    snr_db=snr_db,
+                    channel_type=channel_type,
+                )
 
             h_hat_np = h_hat.cpu().numpy() * hsi_stats["std"] + hsi_stats["mean"]
             l_hat_np = l_hat.cpu().numpy() * lidar_stats["std"] + lidar_stats["mean"]
@@ -289,6 +312,8 @@ def save_reconstruction_figure(
     reconstructions,
     visual_dims,
     output_path,
+    snr_db,
+    channel_type="awgn",
     valid_mask=None,
     lidar_vis_idx=0,
 ):
@@ -331,7 +356,7 @@ def save_reconstruction_figure(
         axes[1, idx + 1].axis("off")
 
     plt.suptitle(
-        "Perception-Enhanced Analysis: Semantic Compression, NMSE, Accuracy, and Channel Robustness",
+        f"Reconstruction Comparison under {channel_type.upper()} Channel (SNR={snr_db} dB)",
         fontsize=16,
         fontweight="bold",
         y=0.98,
@@ -361,6 +386,7 @@ def main():
     epochs = 30
     learning_rate = 0.005
     train_snr_db = 10
+    channel_type = "rayleigh"
     snr_values = [-5, 0, 5, 10, 15, 20]
     visual_dims = [2, 6, 12]
     eval_repeats = 5
@@ -405,7 +431,12 @@ def main():
                 batch_labels = batch_labels.to(device)
 
                 optimizer.zero_grad()
-                hsi_hat, lidar_hat, logits = model(batch_hsi, batch_lidar, snr_db=train_snr_db)
+                hsi_hat, lidar_hat, logits = model(
+                    batch_hsi,
+                    batch_lidar,
+                    snr_db=train_snr_db,
+                    channel_type=channel_type,
+                )
 
                 loss_hsi = criterion_rec(hsi_hat, batch_hsi)
                 loss_lidar = criterion_rec(lidar_hat, batch_lidar)
@@ -418,7 +449,7 @@ def main():
 
             print(f"  Epoch [{epoch + 1}/{epochs}] | Joint Loss: {epoch_loss / len(train_loader):.6f}")
 
-        model_name = f"mode1_dim{actual_total}_trainSNR{train_snr_db}dB_{timestamp}.pth"
+        model_name = f"mode1_dim{actual_total}_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.pth"
         torch.save(model.state_dict(), os.path.join(output_dir, model_name))
         print(f"  -> 模型已保存: {model_name}")
 
@@ -432,7 +463,7 @@ def main():
         }
 
         for snr_db in snr_values:
-            eval_result = evaluate_at_snr(model, test_loader, device, snr_db, num_repeats=eval_repeats)
+            eval_result = evaluate_at_snr(model, test_loader, device, snr_db, channel_type=channel_type, num_repeats=eval_repeats)
             metrics["hsi_nmse"].append(eval_result["hsi_nmse"])
             metrics["lidar_nmse"].append(eval_result["lidar_nmse"])
             metrics["accuracy"].append(eval_result["accuracy"])
@@ -453,41 +484,40 @@ def main():
             lidar_map,
             device,
             snr_db=train_snr_db,
+            channel_type=channel_type,
             hsi_stats=hsi_stats,
             lidar_stats=lidar_stats,
         )
 
-    metrics_fig_name = f"mode1_metrics_trainSNR{train_snr_db}dB_{timestamp}.png"
-    recon_fig_name = f"mode1_reconstruction_trainSNR{train_snr_db}dB_{timestamp}.png"
-    recon_fig_lidar1_name = f"mode1_reconstruction_lidar1_trainSNR{train_snr_db}dB_{timestamp}.png"
-    metrics_json_name = f"mode1_metrics_trainSNR{train_snr_db}dB_{timestamp}.json"
+    metrics_fig_name = f"mode1_metrics_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
+    recon_fig_name = f"mode1_reconstruction_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
+    recon_fig_lidar1_name = f"mode1_reconstruction_lidar1_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
+    metrics_json_name = f"mode1_metrics_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.json"
 
-    save_metric_curves(results_by_dim, snr_values, os.path.join(output_dir, metrics_fig_name))
+    save_metric_curves(
+        results_by_dim,
+        snr_values,
+        os.path.join(output_dir, metrics_fig_name),
+        channel_type=channel_type,
+    )
     save_reconstruction_figure(
         hsi_map,
         lidar_map,
         reconstructions,
         visual_dims,
         os.path.join(output_dir, recon_fig_name),
+        snr_db=train_snr_db,
+        channel_type=channel_type,
         valid_mask=valid_mask if show_valid_region_only else None,
         lidar_vis_idx=0,
     )
-    if lidar_dim > 1:
-        save_reconstruction_figure(
-            hsi_map,
-            lidar_map,
-            reconstructions,
-            visual_dims,
-            os.path.join(output_dir, recon_fig_lidar1_name),
-            valid_mask=valid_mask if show_valid_region_only else None,
-            lidar_vis_idx=1,
-        )
 
     with open(os.path.join(output_dir, metrics_json_name), "w", encoding="utf-8") as file:
         json.dump(
             {
                 "timestamp": timestamp,
                 "train_snr_db": train_snr_db,
+                "channel_type": channel_type,
                 "snr_values": snr_values,
                 "visual_dims": visual_dims,
                 "eval_repeats": eval_repeats,
@@ -511,8 +541,6 @@ def main():
     print(f"输出目录: {output_dir}")
     print(f"指标图: {metrics_fig_name}")
     print(f"重构图: {recon_fig_name}")
-    if lidar_dim > 1:
-        print(f"LiDAR通道1重构图: {recon_fig_lidar1_name}")
     print(f"指标JSON: {metrics_json_name}")
 
 
