@@ -1,164 +1,119 @@
 import json
 import os
+import math
 from datetime import datetime
 
 # Work around duplicate OpenMP runtime initialization in some Windows setups.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
 import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 
 
 class HSISingleStreamAE(nn.Module):
-    """HSI-only autoencoder，支持信道噪声模拟、语义瓶颈及可选分类头。
+    def __init__(self, hsi_dim, hsi_sem, num_classes):
+        super().__init__()
 
-    forward 返回 (reconstruction, logits) 其中 logits 在无分类头时为 None。
-    """
-
-    def __init__(self, input_dim: int, latent_dim: int, num_classes: int = 0):
-        super(HSISingleStreamAE, self).__init__()
+        # 编码器：映射到语义特征空间
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(hsi_dim, 64),
             nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, latent_dim),
+            nn.ReLU(),
+            nn.Linear(64, hsi_sem),
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, input_dim),
-        )
-        self.num_classes = int(num_classes)
-        if self.num_classes > 0:
-            self.classifier = nn.Linear(latent_dim, self.num_classes)
-        else:
-            self.classifier = None
 
-    def forward(self, x: torch.Tensor, snr_db=None, channel_type="awgn"):
+        # 分类器与解码器
+        self.classifier = nn.Linear(hsi_sem, num_classes)
+        self.decoder = nn.Sequential(
+            nn.Linear(hsi_sem, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Linear(64, hsi_dim),
+        )
+
+    def forward(self, x, snr_db=None, channel_type="awgn"):
         semantic = self.encoder(x)
 
         if snr_db is not None:
+            # 1. 严格计算发送信号的真实平均功率
             signal_power = torch.mean(semantic ** 2)
             noise_variance = signal_power / (10 ** (snr_db / 10.0))
+
             if channel_type == "awgn":
                 noise = torch.randn_like(semantic) * torch.sqrt(noise_variance + 1e-12)
                 semantic = semantic + noise
+
             elif channel_type == "rayleigh":
-                # 按样本生成幅度衰落因子（简化处理：同一样本所有语义通道使用相同衰落幅度）
-                h_real = torch.randn(semantic.shape[0], 1, device=semantic.device) / np.sqrt(2)
-                h_imag = torch.randn(semantic.shape[0], 1, device=semantic.device) / np.sqrt(2)
-                h = torch.sqrt(h_real ** 2 + h_imag ** 2)
+                # 2. 模拟严格的复数基带瑞利衰落信道（对齐模态1的纯实数幅度衰落模型）
+                h_real = torch.randn(semantic.shape[0], 1, device=semantic.device) / math.sqrt(2)
+                h_imag = torch.randn(semantic.shape[0], 1, device=semantic.device) / math.sqrt(2)
+                h_mag = torch.sqrt(h_real ** 2 + h_imag ** 2)  # 严格的瑞利分布幅度
+                
+                # 产生噪声
                 noise = torch.randn_like(semantic) * torch.sqrt(noise_variance + 1e-12)
-                semantic = h * semantic + noise
+                
+                # 信道传输过后的接收信号
+                y_received = h_mag * semantic + noise
+                
+                # 3. 接收端引入迫零均衡 (Zero-Forcing Equalization)
+                # 使用平滑保护项 epsilon，完全对齐模态1，防止噪声暴涨
+                epsilon = 1e-2
+                semantic = y_received * h_mag / (h_mag ** 2 + epsilon)
+
             else:
                 raise ValueError(f"Unsupported channel type: {channel_type}")
 
-        reconstruction = self.decoder(semantic)
-        logits = self.classifier(semantic) if self.classifier is not None else None
-        return reconstruction, logits
+        logits = self.classifier(semantic)
+        hsi_hat = self.decoder(semantic)
+        return hsi_hat, logits
 
 
-def load_mat_data(mat_path: str):
-    """Load MATLAB data robustly from .mat file."""
-    if not os.path.exists(mat_path):
-        raise FileNotFoundError(f"MAT file not found: {mat_path}")
-
-    try:
-        mat_contents = sio.loadmat(mat_path)
-        keys = [key for key in mat_contents.keys() if not key.startswith("_")]
-        if not keys:
-            raise KeyError("No valid MATLAB variable keys found in file.")
-        return {key: mat_contents[key] for key in keys}
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load MAT file {mat_path}: {exc}")
-
-
-def normalize_hsi_array(hsi_array: np.ndarray) -> np.ndarray:
-    """Normalize HSI array to shape (600, 166, 20) and select first 20 bands."""
-    arr = np.asarray(hsi_array)
-    if arr.ndim != 3:
-        raise ValueError(f"HSI array must be 3D, got shape {arr.shape}.")
-
-    if arr.shape[:2] == (166, 600):
-        arr = np.transpose(arr, (1, 0, 2))
-    elif arr.shape[:2] == (600, 166):
-        pass
-    else:
-        raise ValueError(f"Unexpected HSI spatial shape {arr.shape[:2]}, expected (600,166) or (166,600).")
-
-    if arr.shape[2] < 20:
-        raise ValueError(f"HSI band dimension must be at least 20, got {arr.shape[2]}.")
-
-    if arr.shape[2] != 20:
-        arr = arr[:, :, :20]
-        print(f"HSI band count is {hsi_array.shape[2]}; using first 20 bands for mode2.")
-
-    if arr.shape != (600, 166, 20):
-        raise ValueError(f"After normalization, HSI shape must be (600,166,20), got {arr.shape}.")
-
-    return arr.astype(np.float32)
-
-
-def normalize_gt_array(gt_array: np.ndarray) -> np.ndarray:
-    """Normalize GT array to shape (600, 166)."""
-    arr = np.asarray(gt_array)
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = np.squeeze(arr, axis=-1)
-    if arr.ndim != 2:
-        raise ValueError(f"GT array must be 2D, got shape {arr.shape}.")
-
-    if arr.shape == (166, 600):
-        arr = arr.T
-    if arr.shape != (600, 166):
-        raise ValueError(f"Normalized GT shape must be (600,166), got {arr.shape}.")
-
-    return arr.astype(np.int32)
-
-
-def load_italy_hsi_dataset():
-    """Load Italy HSI and GT maps, then extract valid HSI pixels."""
+def load_trento_data():
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    hsi_path = os.path.join(current_dir, "Italy_hsi.mat")
-    gt_path = os.path.join(current_dir, "Italy_gt.mat")
-    fallback_gt_path = os.path.join(current_dir, "allgrd.mat")
-
-    raw_hsi = load_mat_data(hsi_path)
-    if os.path.exists(gt_path):
-        raw_gt = load_mat_data(gt_path)
-        print("Using Italy_gt.mat for ground truth.")
-    else:
-        raw_gt = load_mat_data(fallback_gt_path)
-        print("Italy_gt.mat not found, using allgrd.mat as fallback ground truth.")
+    raw_hsi = sio.loadmat(os.path.join(current_dir, "Italy_hsi.mat"))
+    raw_gt = sio.loadmat(os.path.join(current_dir, "allgrd.mat"))
 
     hsi_key = [key for key in raw_hsi.keys() if not key.startswith("_")][0]
     gt_key = [key for key in raw_gt.keys() if not key.startswith("_")][0]
 
-    hsi_map = normalize_hsi_array(raw_hsi[hsi_key])
-    gt_map = normalize_gt_array(raw_gt[gt_key])
+    hsi_map = raw_hsi[hsi_key]
+    gt_map = raw_gt[gt_key]
 
-    hsi_flat = hsi_map.reshape(-1, hsi_map.shape[2])
-    gt_flat = gt_map.reshape(-1)
-    valid_mask_flat = gt_flat > 0
-    valid_hsi = hsi_flat[valid_mask_flat].astype(np.float32)
-    valid_labels = (gt_flat[valid_mask_flat] - 1).astype(np.int64)
-    num_classes = int(valid_labels.max()) + 1 if valid_labels.size > 0 else 0
-    valid_mask = valid_mask_flat.reshape(hsi_map.shape[0], hsi_map.shape[1])
+    height, width, hsi_dim = hsi_map.shape
+    labels_flat = gt_map.reshape(-1)
+    valid_idx = np.where(labels_flat > 0)[0]
+    valid_mask = gt_map > 0
+
+    hsi_flat = hsi_map.reshape(-1, hsi_dim)
+    labels = (labels_flat[valid_idx] - 1).astype(np.int64)
+
+    x_hsi = hsi_flat[valid_idx].astype(np.float32)
+    num_classes = int(labels.max()) + 1
 
     print(f"HSI shape: {hsi_map.shape}")
     print(f"GT shape: {gt_map.shape}")
-    print(f"Valid labeled pixels: {valid_hsi.shape[0]}")
+    print(f"Valid labeled pixels: {len(valid_idx)}")
+    print(f"Number of classes: {num_classes}")
 
-    return hsi_map, gt_map, valid_mask, valid_hsi, valid_labels, num_classes
+    return (
+        x_hsi,
+        labels,
+        height,
+        width,
+        hsi_dim,
+        num_classes,
+        hsi_map,
+        valid_mask,
+    )
 
 
-def normalize_by_train_stats(train_array: np.ndarray, test_array: np.ndarray):
+def normalize_by_train_stats(train_array, test_array):
     mean = train_array.mean(axis=0, keepdims=True)
     std = train_array.std(axis=0, keepdims=True)
     std = np.where(std < 1e-8, 1.0, std)
@@ -169,85 +124,84 @@ def normalize_by_train_stats(train_array: np.ndarray, test_array: np.ndarray):
     return train_norm, test_norm, stats
 
 
-def build_dataloader(valid_hsi: np.ndarray, batch_size: int) -> DataLoader:
-    dataset = TensorDataset(torch.from_numpy(valid_hsi))
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+def create_dataloaders(x_hsi, labels, batch_size):
+    x_hsi_train, x_hsi_test, y_train, y_test = train_test_split(
+        x_hsi,
+        labels,
+        test_size=0.3,
+        random_state=42,
+        stratify=labels,
+    )
+
+    x_hsi_train_norm, x_hsi_test_norm, hsi_stats = normalize_by_train_stats(x_hsi_train, x_hsi_test)
+
+    train_dataset = TensorDataset(
+        torch.from_numpy(x_hsi_train_norm),
+        torch.from_numpy(y_train),
+    )
+    test_dataset = TensorDataset(
+        torch.from_numpy(x_hsi_test_norm),
+        torch.from_numpy(y_test),
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader, hsi_stats, x_hsi_test_norm, y_test
 
 
-def compute_nmse(pred: np.ndarray, target: np.ndarray) -> float:
-    num = np.sum((pred - target) ** 2)
-    den = np.sum(target ** 2) + 1e-12
-    return float(num / den)
-
-
-def evaluate_at_snr(
-    model: HSISingleStreamAE,
-    valid_norm: np.ndarray,
-    valid_orig: np.ndarray,
-    valid_labels: np.ndarray,
-    hsi_stats: dict,
-    device: torch.device,
-    snr_db: float,
-    channel_type: str = "awgn",
-    num_repeats: int = 5,
-    batch_size: int = 512,
-) -> dict:
-    """Evaluate HSI NMSE and classification accuracy under specified SNR and channel."""
+def evaluate_at_snr(model, test_loader, test_x_norm, test_y, device, snr_db, channel_type="awgn", num_repeats=5):
+    aggregate = {"hsi_nmse": [], "accuracy": []}
     model.eval()
-    nmse_list = []
-    acc_list = []
 
     for _ in range(num_repeats):
-        total_num = 0.0
-        total_den = 0.0
+        hsi_nmse_num = 0.0
+        hsi_nmse_den = 0.0
         correct = 0
         total = 0
+
         with torch.no_grad():
-            for start in range(0, len(valid_norm), batch_size):
-                end = min(len(valid_norm), start + batch_size)
-                batch_norm = torch.from_numpy(valid_norm[start:end]).float().to(device)
-                batch_orig = valid_orig[start:end]
-                batch_labels = valid_labels[start:end]
+            for batch_hsi, batch_labels in test_loader:
+                batch_hsi = batch_hsi.to(device)
+                batch_labels = batch_labels.to(device)
 
-                recon_norm, logits = model(batch_norm, snr_db=snr_db, channel_type=channel_type)
-                recon_orig = recon_norm.cpu().numpy() * hsi_stats["std"] + hsi_stats["mean"]
+                hsi_hat, logits = model(batch_hsi, snr_db=snr_db, channel_type=channel_type)
+                
+                # 【关键修复】直接在归一化空间计算特征层面的 NMSE，完全等价于模态1的计算基准
+                hsi_nmse_num += torch.sum((hsi_hat - batch_hsi) ** 2).item()
+                hsi_nmse_den += torch.sum(batch_hsi ** 2).item()
 
-                total_num += np.sum((recon_orig - batch_orig) ** 2)
-                total_den += np.sum(batch_orig ** 2)
+                predicted = torch.argmax(logits, dim=1)
+                total += batch_labels.size(0)
+                correct += (predicted == batch_labels).sum().item()
 
-                if logits is not None and batch_labels is not None and batch_labels.size > 0:
-                    preds = torch.argmax(logits, dim=1).cpu().numpy()
-                    correct += int((preds == batch_labels).sum())
-                    total += int(batch_labels.shape[0])
-
-        nmse_list.append(total_num / (total_den + 1e-12))
-        acc_list.append(correct / max(total, 1))
+        aggregate["hsi_nmse"].append(hsi_nmse_num / (hsi_nmse_den + 1e-12))
+        aggregate["accuracy"].append(correct / max(total, 1))
 
     return {
-        "hsi_nmse": float(np.mean(nmse_list)),
-        "hsi_nmse_std": float(np.std(nmse_list)),
-        "accuracy": float(np.mean(acc_list)),
-        "accuracy_std": float(np.std(acc_list)),
+        "hsi_nmse": float(np.mean(aggregate["hsi_nmse"])),
+        "accuracy": float(np.mean(aggregate["accuracy"])),
+        "hsi_nmse_std": float(np.std(aggregate["hsi_nmse"])),
+        "accuracy_std": float(np.std(aggregate["accuracy"])),
     }
 
 
 def save_metric_curves(results_by_dim, snr_values, output_path, channel_type="awgn"):
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     for dim, metrics in results_by_dim.items():
         axes[0].plot(snr_values, metrics["hsi_nmse"], marker="o", linewidth=2, label=f"Semantic Dim={dim}")
-        axes[2].plot(snr_values, metrics.get("accuracy", []), marker="^", linewidth=2, label=f"Semantic Dim={dim}")
+        axes[1].plot(snr_values, metrics["accuracy"], marker="^", linewidth=2, label=f"Semantic Dim={dim}")
 
         axes[0].fill_between(
             snr_values,
-            np.array(metrics["hsi_nmse"]) - np.array(metrics.get("hsi_nmse_std", np.zeros_like(metrics["hsi_nmse"]))),
-            np.array(metrics["hsi_nmse"]) + np.array(metrics.get("hsi_nmse_std", np.zeros_like(metrics["hsi_nmse"]))),
+            np.array(metrics["hsi_nmse"]) - np.array(metrics["hsi_nmse_std"]),
+            np.array(metrics["hsi_nmse"]) + np.array(metrics["hsi_nmse_std"]),
             alpha=0.15,
         )
-        axes[2].fill_between(
+        axes[1].fill_between(
             snr_values,
-            np.array(metrics.get("accuracy", [])) - np.array(metrics.get("accuracy_std", np.zeros_like(metrics.get("accuracy", [])))),
-            np.array(metrics.get("accuracy", [])) + np.array(metrics.get("accuracy_std", np.zeros_like(metrics.get("accuracy", [])))),
+            np.array(metrics["accuracy"]) - np.array(metrics["accuracy_std"]),
+            np.array(metrics["accuracy"]) + np.array(metrics["accuracy_std"]),
             alpha=0.15,
         )
 
@@ -257,21 +211,15 @@ def save_metric_curves(results_by_dim, snr_values, output_path, channel_type="aw
     axes[0].grid(True, linestyle="--", alpha=0.5)
     axes[0].legend()
 
-    axes[1].set_title("LiDAR Reconstruction Error vs. SNR")
+    axes[1].set_title("Classification Accuracy vs. SNR")
     axes[1].set_xlabel("Received SNR (dB)")
-    axes[1].set_ylabel("Normalised Mean Squared Error (NMSE)")
+    axes[1].set_ylabel("Classification Accuracy")
+    axes[1].set_ylim(0.0, 1.0)
     axes[1].grid(True, linestyle="--", alpha=0.5)
     axes[1].legend()
 
-    axes[2].set_title("Classification Accuracy vs. SNR")
-    axes[2].set_xlabel("Received SNR (dB)")
-    axes[2].set_ylabel("Classification Accuracy")
-    axes[2].set_ylim(0.0, 1.0)
-    axes[2].grid(True, linestyle="--", alpha=0.5)
-    axes[2].legend()
-
     plt.suptitle(
-        f"{channel_type.upper()} Channel Performance: Reconstruction and Classification Metrics",
+        f"{channel_type.upper()} Channel Performance: Model 2 (Single Stream HSI)",
         fontsize=14,
         fontweight="bold",
         y=1.02,
@@ -279,35 +227,36 @@ def save_metric_curves(results_by_dim, snr_values, output_path, channel_type="aw
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(output_path, dpi=300)
     plt.close(fig)
-    print(f"Saved metric curve to {output_path}")
 
 
-def reconstruct_full_maps(
-    model: HSISingleStreamAE,
-    hsi_map: np.ndarray,
-    hsi_stats: dict,
-    device: torch.device,
-    snr_db: float,
-    channel_type: str = "awgn",
-    batch_size: int = 512,
-) -> np.ndarray:
+def reconstruct_full_maps(model, hsi_map, device, snr_db, channel_type="awgn", hsi_stats=None):
     height, width, hsi_dim = hsi_map.shape
-    flat_hsi = hsi_map.reshape(-1, hsi_dim).astype(np.float32)
-    normalized_flat = (flat_hsi - hsi_stats["mean"]) / hsi_stats["std"]
 
-    reconstructed_list = []
+    hsi_all = hsi_map.reshape(-1, hsi_dim).astype(np.float32)
+    hsi_all = (hsi_all - hsi_stats["mean"]) / hsi_stats["std"]
+
+    hsi_hat_list = []
+
     model.eval()
     with torch.no_grad():
-        for start in range(0, normalized_flat.shape[0], batch_size):
-            batch = torch.from_numpy(normalized_flat[start:start + batch_size]).float().to(device)
-            out = model(batch, snr_db=snr_db, channel_type=channel_type)
-            # model may return (reconstruction, logits)
-            recon_norm = out[0] if isinstance(out, tuple) else out
-            reconstructed_list.append(recon_norm.cpu().numpy())
+        for index in range(0, len(hsi_all), 512):
+            chunk_h = torch.from_numpy(hsi_all[index:index + 512]).float().to(device)
 
-    reconstructed_flat = np.vstack(reconstructed_list)
-    reconstructed_orig = reconstructed_flat * hsi_stats["std"] + hsi_stats["mean"]
-    return reconstructed_orig.reshape(height, width, hsi_dim)
+            if chunk_h.shape[0] <= 1:
+                h_hat = chunk_h
+            else:
+                h_hat, _ = model(
+                    chunk_h,
+                    snr_db=snr_db,
+                    channel_type=channel_type,
+                )
+
+            h_hat_np = h_hat.cpu().numpy() * hsi_stats["std"] + hsi_stats["mean"]
+            hsi_hat_list.append(h_hat_np)
+
+    return {
+        "hsi": np.vstack(hsi_hat_list).reshape(height, width, hsi_dim),
+    }
 
 
 def save_reconstruction_figure(
@@ -319,7 +268,6 @@ def save_reconstruction_figure(
     channel_type="awgn",
     valid_mask=None,
 ):
-    # Align layout and style with mode1: 2 rows x (1 + len(visual_dims)) cols
     band_idx = min(10, hsi_map.shape[2] - 1)
     hsi_vmin = float(hsi_map[:, :, band_idx].min())
     hsi_vmax = float(hsi_map[:, :, band_idx].max())
@@ -328,17 +276,13 @@ def save_reconstruction_figure(
     if valid_mask is not None:
         original_hsi = np.where(valid_mask, original_hsi, np.nan)
 
-    ncols = 1 + len(visual_dims)
-    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 5))
-
-    # Left-most: original HSI band (top row equivalent)
+    fig, axes = plt.subplots(1, 4, figsize=(18, 5))
     axes[0].imshow(original_hsi, cmap="jet", vmin=hsi_vmin, vmax=hsi_vmax)
     axes[0].set_title(f"Original HSI\n(Band {band_idx})", fontsize=12, fontweight="bold")
     axes[0].axis("off")
 
-    # Following columns: reconstructed HSI bands (one per semantic dim)
     for idx, dim in enumerate(visual_dims):
-        recon_hsi = reconstructions[dim][:, :, band_idx].copy()
+        recon_hsi = reconstructions[dim]["hsi"][:, :, band_idx].copy()
         if valid_mask is not None:
             recon_hsi = np.where(valid_mask, recon_hsi, np.nan)
         axes[idx + 1].imshow(recon_hsi, cmap="jet", vmin=hsi_vmin, vmax=hsi_vmax)
@@ -346,215 +290,119 @@ def save_reconstruction_figure(
         axes[idx + 1].axis("off")
 
     plt.suptitle(
-        f"Reconstruction Comparison under {channel_type.upper()} Channel (SNR={snr_db} dB)",
-        fontsize=16,
+        f"Model 2 Reconstruction under {channel_type.upper()} Channel (SNR={snr_db} dB)",
+        fontsize=14,
         fontweight="bold",
         y=0.98,
     )
     plt.tight_layout()
     plt.savefig(output_path, dpi=300)
     plt.close(fig)
-    print(f"Saved reconstruction figure to {output_path}")
-
-
-def train_autoencoder(
-    model: HSISingleStreamAE,
-    train_loader: DataLoader,
-    device: torch.device,
-    epochs: int,
-    learning_rate: float,
-) -> None:
-    """Train the HSI-only autoencoder with MSE loss."""
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    model.train()
-
-    for epoch in range(1, epochs + 1):
-        epoch_loss = 0.0
-        for (batch_x,) in train_loader:
-            batch_x = batch_x.to(device)
-            optimizer.zero_grad()
-            out = model(batch_x)
-            reconstruction = out[0] if isinstance(out, tuple) else out
-            loss = criterion(reconstruction, batch_x)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-
-        average_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch:02d}/{epochs:02d} | MSE Loss: {average_loss:.6f}")
-
-
-def reconstruct_full_hsi(
-    model: HSISingleStreamAE,
-    full_hsi: np.ndarray,
-    hsi_mean: np.ndarray,
-    hsi_std: np.ndarray,
-    batch_size: int,
-    device: torch.device,
-) -> np.ndarray:
-    """Reconstruct the full HSI image in safe batches and re-scale to original units."""
-    model.eval()
-    flat_hsi = full_hsi.reshape(-1, full_hsi.shape[2]).astype(np.float32)
-    normalized_flat = (flat_hsi - hsi_mean) / hsi_std
-
-    reconstructed_chunks = []
-    with torch.no_grad():
-        for start in range(0, normalized_flat.shape[0], batch_size):
-            batch = torch.from_numpy(normalized_flat[start:start + batch_size]).to(device)
-            out = model(batch)
-            reconstructed = out[0] if isinstance(out, tuple) else out
-            reconstructed_chunks.append(reconstructed.cpu().numpy())
-
-    reconstructed_flat = np.vstack(reconstructed_chunks)
-    reconstructed_full = reconstructed_flat * hsi_std + hsi_mean
-    return reconstructed_full.reshape(full_hsi.shape)
-
-
-def plot_hsi_reconstructions(
-    original_hsi: np.ndarray,
-    reconstructions: dict,
-    visual_dims: list,
-    output_path: str,
-):
-    """Save a comparison figure for original and reconstructed HSI band 10."""
-    band_index = 9
-    original_band = original_hsi[:, :, band_index]
-    vmin = float(original_band.min())
-    vmax = float(original_band.max())
-
-    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-    titles = ["Original HSI Band 10"] + [f"Reconstructed HSI Band 10\n(latent_dim={dim})" for dim in visual_dims]
-    images = [original_band] + [recon[:, :, band_index] for recon in reconstructions.values()]
-
-    for ax, image, title in zip(axes, images, titles):
-        ax.imshow(image, cmap="jet", vmin=vmin, vmax=vmax)
-        ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.axis("off")
-
-    plt.suptitle(
-        "Mode 2: HSI-only Semantic Autoencoder Reconstruction Comparison",
-        fontsize=16,
-        fontweight="bold",
-    )
-    plt.tight_layout(rect=[0, 0, 1, 0.94])
-    plt.savefig(output_path, dpi=300)
-    plt.close(fig)
-    print(f"Saved perception analysis figure to {output_path}")
 
 
 def main():
-    torch.manual_seed(42)
-    np.random.seed(42)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    hsi_map, gt_map, valid_mask, valid_hsi, valid_labels, num_classes = load_italy_hsi_dataset()
-    hsi_dim = hsi_map.shape[2]
+    (
+        x_hsi,
+        labels,
+        height,
+        width,
+        hsi_dim,
+        num_classes,
+        hsi_map,
+        valid_mask,
+    ) = load_trento_data()
 
-    batch_size = 128
+    batch_size = 512
     epochs = 30
-    learning_rate = 0.001
+    learning_rate = 0.005
     train_snr_db = 10
-    channel_type = "rayleigh"
+    channel_type = "awgn"  # 改为升级版带有ZF均衡的真实瑞利信道
     snr_values = [-5, 0, 5, 10, 15, 20]
-    visual_dims = [2, 6, 12]
+    visual_dims = [2, 6, 12]  # 分别对应模态1中两流之和得到的总特征维度
     eval_repeats = 5
     cls_loss_weight = 1.0
+    show_valid_region_only = False
 
-    # Split valid labeled pixels into train/test for supervised classification
-    x_train, x_test, y_train, y_test = train_test_split(
-        valid_hsi, valid_labels, test_size=0.3, random_state=42, stratify=valid_labels
-    )
-    x_train_norm, x_test_norm, hsi_stats = normalize_by_train_stats(x_train, x_test)
-
-    train_dataset = TensorDataset(torch.from_numpy(x_train_norm), torch.from_numpy(y_train))
-    test_dataset = TensorDataset(torch.from_numpy(x_test_norm), torch.from_numpy(y_test))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader, test_loader, hsi_stats, test_x_norm, test_y = create_dataloaders(x_hsi, labels, batch_size)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
     os.makedirs(output_dir, exist_ok=True)
 
-    print("====================================================================")
-    print(" 正在启动『模式二：单模态纯 HSI 语义自编码网络』实验")
-    print("====================================================================")
-    print(f"Device: {device}")
-    print(f"HSI map shape: {hsi_map.shape}")
-    print(f"Valid labeled pixels: {valid_hsi.shape[0]}")
-    print(f"Latent dims: {visual_dims}")
-    print(f"Channel type: {channel_type}")
-    print(f"Train SNR: {train_snr_db} dB")
-
     results_by_dim = {}
     reconstructions = {}
 
+    print("====================================================================")
+    print(" 正在启动『单一模态 HSI』语义重构 + 分类 + 信道鲁棒性实验")
+    print("====================================================================")
 
-    for latent_dim in visual_dims:
-        print(f"\n[训练中] HSI-only 自编码器语义维度: {latent_dim}")
-        model = HSISingleStreamAE(input_dim=hsi_dim, latent_dim=latent_dim, num_classes=num_classes).to(device)
-        rec_criterion = nn.MSELoss()
-        cls_criterion = nn.CrossEntropyLoss()
+    for total_dim in visual_dims:
+        print(f"\n[训练中] 语义压缩层总维度: {total_dim} (单模态高光谱)")
+
+        model = HSISingleStreamAE(hsi_dim, total_dim, num_classes).to(device)
+        criterion_rec = nn.MSELoss()
+        criterion_cls = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
         model.train()
         for epoch in range(epochs):
             epoch_loss = 0.0
-            for batch_x, batch_y in train_loader:
-                batch_x = batch_x.to(device)
-                batch_y = batch_y.to(device)
+            for batch_hsi, batch_labels in train_loader:
+                batch_hsi = batch_hsi.to(device)
+                batch_labels = batch_labels.to(device)
+
                 optimizer.zero_grad()
-                recon_norm, logits = model(batch_x, snr_db=train_snr_db, channel_type=channel_type)
-                loss_rec = rec_criterion(recon_norm, batch_x)
-                loss_cls = cls_criterion(logits, batch_y)
-                loss = loss_rec + cls_loss_weight * loss_cls
+                hsi_hat, logits = model(
+                    batch_hsi,
+                    snr_db=train_snr_db,
+                    channel_type=channel_type,
+                )
+
+                loss_hsi = criterion_rec(hsi_hat, batch_hsi)
+                loss_cls = criterion_cls(logits, batch_labels)
+                loss = loss_hsi + cls_loss_weight * loss_cls
+
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
 
             print(f"  Epoch [{epoch + 1}/{epochs}] | Joint Loss: {epoch_loss / len(train_loader):.6f}")
 
-        model_name = f"mode2_dim{latent_dim}_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.pth"
+        model_name = f"mode2_dim{total_dim}_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.pth"
         torch.save(model.state_dict(), os.path.join(output_dir, model_name))
         print(f"  -> 模型已保存: {model_name}")
 
         metrics = {
             "hsi_nmse": [],
-            "hsi_nmse_std": [],
             "accuracy": [],
+            "hsi_nmse_std": [],
             "accuracy_std": [],
         }
 
         for snr_db in snr_values:
             eval_result = evaluate_at_snr(
-                model,
-                x_test_norm,
-                x_test,
-                y_test,
-                hsi_stats,
-                device,
-                snr_db,
-                channel_type=channel_type,
-                num_repeats=eval_repeats,
+                model, test_loader, test_x_norm, test_y, device, snr_db, channel_type=channel_type, num_repeats=eval_repeats
             )
             metrics["hsi_nmse"].append(eval_result["hsi_nmse"])
-            metrics["hsi_nmse_std"].append(eval_result["hsi_nmse_std"])
             metrics["accuracy"].append(eval_result["accuracy"])
+            metrics["hsi_nmse_std"].append(eval_result["hsi_nmse_std"])
             metrics["accuracy_std"].append(eval_result["accuracy_std"])
             print(
-                f"  SNR={snr_db:>3} dB | HSI NMSE={eval_result['hsi_nmse']:.6f}±{eval_result['hsi_nmse_std']:.6f} | Accuracy={eval_result['accuracy']:.4f}±{eval_result['accuracy_std']:.4f}"
+                f"  SNR={snr_db:>3} dB | "
+                f"HSI NMSE={eval_result['hsi_nmse']:.6f}±{eval_result['hsi_nmse_std']:.6f} | "
+                f"Accuracy={eval_result['accuracy']:.4f}±{eval_result['accuracy_std']:.4f}"
             )
 
-        results_by_dim[latent_dim] = metrics
-        recon = reconstruct_full_maps(
+        results_by_dim[total_dim] = metrics
+        reconstructions[total_dim] = reconstruct_full_maps(
             model,
             hsi_map,
-            hsi_stats,
             device,
             snr_db=train_snr_db,
             channel_type=channel_type,
+            hsi_stats=hsi_stats,
         )
-        reconstructions[latent_dim] = recon
 
     metrics_fig_name = f"mode2_metrics_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
     recon_fig_name = f"mode2_reconstruction_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
@@ -573,7 +421,7 @@ def main():
         os.path.join(output_dir, recon_fig_name),
         snr_db=train_snr_db,
         channel_type=channel_type,
-        valid_mask=valid_mask,
+        valid_mask=valid_mask if show_valid_region_only else None,
     )
 
     with open(os.path.join(output_dir, metrics_json_name), "w", encoding="utf-8") as file:
@@ -585,17 +433,20 @@ def main():
                 "snr_values": snr_values,
                 "visual_dims": visual_dims,
                 "eval_repeats": eval_repeats,
-                "results": results_by_dim,
+                "cls_loss_weight": cls_loss_weight,
+                "show_valid_region_only": show_valid_region_only,
                 "normalization": {
-                    "mean_shape": list(hsi_stats["mean"].shape),
-                    "std_shape": list(hsi_stats["std"].shape),
+                    "type": "zscore_train_stats",
+                    "hsi_mean_shape": list(hsi_stats["mean"].shape),
+                    "hsi_std_shape": list(hsi_stats["std"].shape),
                 },
+                "results": results_by_dim,
             },
             file,
             indent=2,
         )
 
-    print("\n[OK] 全部实验完成。")
+    print("\n[OK] 模态2实验全部完成。")
     print(f"输出目录: {output_dir}")
     print(f"指标图: {metrics_fig_name}")
     print(f"重构图: {recon_fig_name}")

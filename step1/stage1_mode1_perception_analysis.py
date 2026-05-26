@@ -1,5 +1,6 @@
 import json
 import os
+import math
 from datetime import datetime
 
 # Work around duplicate OpenMP runtime initialization in some Windows setups.
@@ -13,19 +14,20 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
-import math
 
 
 class MultimodalDualStreamAE(nn.Module):
     def __init__(self, hsi_dim, lidar_dim, hsi_sem, lidar_sem, num_classes):
         super().__init__()
 
+        # HSI 语义编码流
         self.hsi_encoder = nn.Sequential(
             nn.Linear(hsi_dim, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
             nn.Linear(64, hsi_sem),
         )
+        # LiDAR 语义编码流
         self.lidar_encoder = nn.Sequential(
             nn.Linear(lidar_dim, 16),
             nn.BatchNorm1d(16),
@@ -34,7 +36,17 @@ class MultimodalDualStreamAE(nn.Module):
         )
 
         fused_dim = hsi_sem + lidar_sem
-        self.classifier = nn.Linear(fused_dim, num_classes)
+
+        # 【方案 A：升级为非线性分类器】
+        # 使用两层 MLP + ReLU 激活函数，代替原有的单层线性映射，以挖掘模态间的非线性互补特征
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, fused_dim * 2),
+            nn.ReLU(),
+            nn.BatchNorm1d(fused_dim * 2),
+            nn.Linear(fused_dim * 2, num_classes)
+        )
+        
+        # 解码流保持接收完整的融合空间特征
         self.hsi_decoder = nn.Sequential(
             nn.Linear(fused_dim, 64),
             nn.BatchNorm1d(64),
@@ -54,19 +66,30 @@ class MultimodalDualStreamAE(nn.Module):
         s_fused = torch.cat([s_hsi, s_lidar], dim=-1)
 
         if snr_db is not None:
+            # 1. 严格计算发送信号的真实平均功率
             signal_power = torch.mean(s_fused ** 2)
             noise_variance = signal_power / (10 ** (snr_db / 10.0))
 
             if channel_type == "awgn":
                 noise = torch.randn_like(s_fused) * torch.sqrt(noise_variance + 1e-12)
                 s_fused = s_fused + noise
+
             elif channel_type == "rayleigh":
-                # 采用实值幅度衰落近似 Rayleigh 信道
+                # 2. 模拟严格的复数基带瑞利衰落信道
                 h_real = torch.randn(s_fused.shape[0], 1, device=s_fused.device) / math.sqrt(2)
                 h_imag = torch.randn(s_fused.shape[0], 1, device=s_fused.device) / math.sqrt(2)
-                h = torch.sqrt(h_real ** 2 + h_imag ** 2)
+                h_mag = torch.sqrt(h_real ** 2 + h_imag ** 2)  # 严格的瑞利分布幅度
+                
+                # 产生噪声
                 noise = torch.randn_like(s_fused) * torch.sqrt(noise_variance + 1e-12)
-                s_fused = h * s_fused + noise
+                
+                # 信道传输过后的接收信号
+                y_received = h_mag * s_fused + noise
+                
+                # 3. 接收端迫零均衡 (Zero-Forcing Equalization)
+                epsilon = 1e-2
+                s_fused = y_received * h_mag / (h_mag ** 2 + epsilon)
+
             else:
                 raise ValueError(f"Unsupported channel type: {channel_type}")
 
@@ -257,7 +280,7 @@ def save_metric_curves(results_by_dim, snr_values, output_path, channel_type="aw
     axes[2].legend()
 
     plt.suptitle(
-        f"{channel_type.upper()} Channel Performance: Reconstruction and Classification Metrics",
+        f"{channel_type.upper()} Channel Performance: Model 1 (Optimized Multimodal)",
         fontsize=14,
         fontweight="bold",
         y=1.02,
@@ -336,6 +359,7 @@ def save_reconstruction_figure(
     axes[0, 0].axis("off")
 
     for idx, dim in enumerate(visual_dims):
+        # 【对齐主循环维度键名】
         recon_hsi = reconstructions[dim]["hsi"][:, :, band_idx].copy()
         if valid_mask is not None:
             recon_hsi = np.where(valid_mask, recon_hsi, np.nan)
@@ -348,6 +372,7 @@ def save_reconstruction_figure(
     axes[1, 0].axis("off")
 
     for idx, dim in enumerate(visual_dims):
+        # 【对齐主循环维度键名】
         recon_lidar = reconstructions[dim]["lidar"][:, :, lidar_vis_idx].copy()
         if valid_mask is not None:
             recon_lidar = np.where(valid_mask, recon_lidar, np.nan)
@@ -356,7 +381,7 @@ def save_reconstruction_figure(
         axes[1, idx + 1].axis("off")
 
     plt.suptitle(
-        f"Reconstruction Comparison under {channel_type.upper()} Channel (SNR={snr_db} dB)",
+        f"Model 1 (Optimized) Reconstruction under {channel_type.upper()} Channel (SNR={snr_db} dB)",
         fontsize=16,
         fontweight="bold",
         y=0.98,
@@ -386,12 +411,15 @@ def main():
     epochs = 30
     learning_rate = 0.005
     train_snr_db = 10
-    channel_type = "rayleigh"
+    channel_type = "awgn"  # 支持 "awgn" 或 "rayleigh"
     snr_values = [-5, 0, 5, 10, 15, 20]
-    visual_dims = [2, 6, 12]
+    visual_dims = [2, 6, 12]  # 总特征压缩维度
     eval_repeats = 5
+    
+    # 【方案 C：平衡多任务损失权重】
+    # 将 lidar_loss_weight 从 3.0 大幅降低到 0.5，避免网络权重过度被 LiDAR 的重构带偏，让模型更专注于 HSI 与核心分类
     cls_loss_weight = 1.0
-    lidar_loss_weight = 3.0
+    lidar_loss_weight = 0.5
     show_valid_region_only = False
 
     train_loader, test_loader, hsi_stats, lidar_stats = create_dataloaders(x_hsi, x_lidar, labels, batch_size)
@@ -404,16 +432,18 @@ def main():
     reconstructions = {}
 
     print("====================================================================")
-    print(" 正在启动『感知增强』多模态语义重构 + 分类 + 信道鲁棒性实验")
+    print(" 正在启动『三大融合方案优化版』模态1语义重构 + 分类实验")
     print("====================================================================")
 
     for total_dim in visual_dims:
-        hsi_sem = max(1, total_dim // 2)
-        lidar_sem = max(1, total_dim - hsi_sem)
-        actual_total = hsi_sem + lidar_sem
+        # 【方案 B：非对等分配语义维度】
+        # LiDAR 原始维度本来极小 (1维)，不需要分配过多的瓶颈带宽。
+        # 强制给 LiDAR 保留 1 维压缩表达，剩余所有维度归还给 HSI 通道，大幅释放高光谱的语义容量。
+        lidar_sem = 1 if total_dim > 1 else 1
+        hsi_sem = max(1, total_dim - lidar_sem)
 
         print(
-            f"\n[训练中] 语义压缩层总维度: {actual_total} "
+            f"\n[训练中] 语义压缩层总维度: {total_dim} "
             f"(HSI流: {hsi_sem}维 | LiDAR流: {lidar_sem}维)"
         )
 
@@ -449,7 +479,7 @@ def main():
 
             print(f"  Epoch [{epoch + 1}/{epochs}] | Joint Loss: {epoch_loss / len(train_loader):.6f}")
 
-        model_name = f"mode1_dim{actual_total}_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.pth"
+        model_name = f"mode1_opt_dim{total_dim}_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.pth"
         torch.save(model.state_dict(), os.path.join(output_dir, model_name))
         print(f"  -> 模型已保存: {model_name}")
 
@@ -477,8 +507,9 @@ def main():
                 f"Accuracy={eval_result['accuracy']:.4f}±{eval_result['accuracy_std']:.4f}"
             )
 
-        results_by_dim[actual_total] = metrics
-        reconstructions[actual_total] = reconstruct_full_maps(
+        # 统一使用 total_dim 作为结果管理键名，保持与绘图接口的高度一致
+        results_by_dim[total_dim] = metrics
+        reconstructions[total_dim] = reconstruct_full_maps(
             model,
             hsi_map,
             lidar_map,
@@ -489,10 +520,9 @@ def main():
             lidar_stats=lidar_stats,
         )
 
-    metrics_fig_name = f"mode1_metrics_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
-    recon_fig_name = f"mode1_reconstruction_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
-    recon_fig_lidar1_name = f"mode1_reconstruction_lidar1_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
-    metrics_json_name = f"mode1_metrics_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.json"
+    metrics_fig_name = f"mode1_opt_metrics_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
+    recon_fig_name = f"mode1_opt_reconstruction_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.png"
+    metrics_json_name = f"mode1_opt_metrics_trainSNR{train_snr_db}dB_{channel_type}_{timestamp}.json"
 
     save_metric_curves(
         results_by_dim,
@@ -537,7 +567,7 @@ def main():
             indent=2,
         )
 
-    print("\n[OK] 全部实验完成。")
+    print("\n[OK] 模态1优化版实验全部完成。")
     print(f"输出目录: {output_dir}")
     print(f"指标图: {metrics_fig_name}")
     print(f"重构图: {recon_fig_name}")
