@@ -17,3 +17,8 @@ step1/__pycache__/
 semantic_reconstruction_result.png
 data/
 Figure_*.png
+step2/data/
+step2/model1/
+step2/model2/
+step2/model3/
+step2/__pycache__/
